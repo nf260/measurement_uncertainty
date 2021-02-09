@@ -340,14 +340,16 @@ def performance_table(qc_data, eqa_data, assay, count_thresh, targets):
     
     ### Calculate performance against performance targets
     def performance(value, optimal, desirable, minimal):
-        if value < optimal:
+        if value <= optimal:
             return "Optimal"
-        elif value < desirable:
+        elif value <= desirable:
             return "Desirable"
-        elif value < minimal:
+        elif value <= minimal:
             return "Minimal"
-        else:
+        elif value > minimal:
             return "Not met"
+        else:
+            return ""
     
     df['CV performance'] = df.apply(lambda x: performance(x['% CV'],x['Anal CV Optimal'],x['Anal CV Desirable'],x['Anal CV Minimal']), axis = 1)
     df['Bias performance'] = df.apply(lambda x: performance(x['% Bias'],x['Bias Optimal'],x['Bias Desirable'],x['Bias Minimal']), axis = 1)
@@ -359,3 +361,18 @@ def performance_table(qc_data, eqa_data, assay, count_thresh, targets):
     df[['% CV','% Bias','Total error']] = df[['% CV','% Bias','Total error']].fillna('')
     
     return df
+
+def assay_performance_data_export(qc_data, eqa_data, count_thresh, targets):
+    '''
+    Createsa a performance summary table for each assay.
+    
+    Exports each table to a .csv file in the processed data folder
+    '''
+    for assay in qc_data['Assay'].unique():
+        try:
+            filepath = os.path.abspath('') + '\\data\\processed\\performance_summary_tables\\' + assay + '.csv'
+            table =  performance_table(qc_data, eqa_data, assay, count_thresh, targets)
+            table.to_csv(filepath)
+            print(f'{assay} succesfully exported')
+        except:
+            print(f'!!! Error in exporting data for {assay}')
