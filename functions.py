@@ -28,8 +28,8 @@ def load_randox(filename, mappings):
     csf_aa = randoxMU[randoxMU['Instrument'] == 'AAA+'].copy()
     csf_aa['Randox'] = csf_aa['Randox'].astype(str) + ' (CSF)'
     
-    ## For urine/plasma, identify urine QC by the lot number starting with "AAU"
-    randoxMU['Randox'][randoxMU['Lot Name'].str[:3] == 'AAU'] = randoxMU['Randox'].astype(str) + ' (Urine)'
+    ## For urine/plasma, identify urine QC (except phosphoethanolamine) by the lot number starting with "AAU"
+    randoxMU['Randox'][randoxMU['Lot Name'].str[:3] == 'AAU'] = randoxMU['Randox'].astype(str) + ' (Urine)' 
     
     ## Add the CSF amino acid QCs to the rest of the QC data
     ## (needs to be after previous step to avoid adding "urine" suffix)
@@ -70,7 +70,6 @@ def qc_lot_summary(qc_data, assay, count_thresh=1):
     assay_qc_pivot = assay_qc_pivot.reindex(column_order, level=2, axis=1)
     
     ## Merge with mappings to show all measurands (so that they appear even if no QC data) and order by sort order
-    
     mappings = pd.read_csv("data\\raw_data\\mappings.csv")
     all_measurands = mappings[mappings['Assay'] == assay]
     all_measurands = all_measurands.reset_index()[['Measurand','Order']]
@@ -129,7 +128,7 @@ def qc_aggregated(qc_data, assay, count_thresh=1):
     # need to rename column so it doesn't have a space for df. naming
     aggregated = aggregated.rename(columns={'% CV':'value'})
     aggregated['value'] = aggregated.apply(
-    lambda x: np.sqrt(int(aggregated.loc[x.ratio_numerator]['value'])**2 + int(aggregated.loc[x.ratio_denominator]['value'])**2)
+    lambda x: np.sqrt(float(aggregated.loc[x.ratio_numerator]['value'])**2 + float(aggregated.loc[x.ratio_denominator]['value'])**2)
     if x.IsRatio else x.value
     ,axis=1
     )
@@ -137,11 +136,6 @@ def qc_aggregated(qc_data, assay, count_thresh=1):
     # rename the column again
     aggregated = aggregated.rename(columns={'value':'% CV'})
 
-    ## Calculate complex ratio (for acylcarnitines)
-    
-#     if assay='Acylcarnitines (Blood spot)':
-#         aggregated[aggregated['Measurand'] == '(C16 + C18:1)/C2 ratio']['% CV'] = 
-    
     ## Calculate expanded uncertainty
     aggregated['Expanded uncertainty'] = aggregated['% CV'] * 2
     
@@ -289,22 +283,45 @@ def eqa_summary_statistics(df,assay):
     
     ## Combine standard deviation of bias with average uncertainty in the target value
     eqa_summary['Combined uncertainty of % bias'] = eqa_summary.apply(lambda x: combined_uncertainty(x[('% Bias','std')],x[('% uncertainty in target value', 'mean')]), axis = 1)
-    
-    ## Calculate expanded uncertainty in the bias estimate (using coverage factor k=2)
-    eqa_summary['Expanded uncertainty of % bias'] = eqa_summary['Combined uncertainty of % bias'].apply(lambda x: x*2)
 
     ## Merge with all measurands and sort
     mappings = pd.read_csv("data\\raw_data\\mappings.csv")
     all_measurands = mappings[mappings['Assay'] == assay]
-    all_measurands = all_measurands.reset_index()[['Measurand','Order']]
+    all_measurands = all_measurands.reset_index()[['Measurand','Order','IsRatio','ratio_numerator','ratio_denominator']]
     
     eqa_summary = eqa_summary.merge(right=all_measurands,on='Measurand',how='outer')
     eqa_summary = eqa_summary.sort_values(by='Order', ignore_index=True)
-    eqa_summary = eqa_summary.drop(columns='Order')   
 
     ## Reset index
     eqa_summary = eqa_summary.set_index('Measurand')
+    
+    ## Calculate ratios
+    # rename columns so that can use dot naming
+    eqa_summary = eqa_summary.rename(columns={('% Bias', 'mean'):'bias',('Combined uncertainty of % bias','' ):'biasstd'})
+    
+    # Calculate bias of ratio
+    eqa_summary['bias'] = eqa_summary.apply(
+    lambda x: ((float(100 + eqa_summary.loc[x.ratio_numerator]['bias']) / float(100 + eqa_summary.loc[x.ratio_denominator]['bias']))-1)*100
+    if x.IsRatio else x.bias,
+    axis=1
+    ) 
+    
+    # calculate combined uncertainty of bias for ratios
+    eqa_summary['biasstd'] = eqa_summary.apply(
+    lambda x: np.sqrt(float(eqa_summary.loc[x.ratio_numerator]['biasstd'])**2 + float(eqa_summary.loc[x.ratio_denominator]['biasstd'])**2)
+    if x.IsRatio else x.biasstd
+    ,axis=1
+    )
+    
+    # rename the column back again
+    eqa_summary = eqa_summary.rename(columns={'bias':('% Bias', 'mean'),'biasstd':('Combined uncertainty of % bias','' )})
 
+    # Calculate expanded uncertainty of % bias using a coverage factor of 2
+    eqa_summary['Expanded uncertainty of % bias'] = eqa_summary[('Combined uncertainty of % bias','')].apply(lambda x: x*2)
+    
+    ## Drop columns
+    eqa_summary = eqa_summary.drop(columns=['Order','IsRatio','ratio_numerator','ratio_denominator'])        
+    
     ## Round values
     eqa_summary = eqa_summary.round(2)
     
@@ -359,8 +376,8 @@ def performance_table(qc_data, eqa_data, assay, count_thresh, targets):
     
     # Select only the % Bias column and measurand name
     bias.columns = bias.columns.get_level_values(0)
-    bias = bias.reset_index()[['Measurand','Combined uncertainty of % bias']]
-    bias = bias.rename(columns={'Combined uncertainty of % bias':'% Bias'})
+    bias = bias.reset_index()[['Measurand',('Combined uncertainty of % bias','')]]
+    bias = bias.rename(columns={('Combined uncertainty of % bias',''):'% Bias'})
     
     ### Merge imprecision and bias data
     df = imprec.merge(right=bias,on='Measurand',how='outer')
@@ -415,12 +432,13 @@ def assay_performance_data_export(qc_data, eqa_data, count_thresh, targets, comb
             try:
                 table =  performance_table(qc_data, eqa_data, assay, count_thresh, targets)
                 table['Assay'] = assay
-                df = pd.concat([df,table],ignore_index=True)
+                df = pd.concat([df,table],ignore_index=False)
+                print(f'Performance table for {assay} succesfully exported') 
             except:
                 print(f'!!! Error for assay: {assay}')                
         
-    df.to_csv(filepath)
-    print('Performance table succesfully exported')    
+        df.to_csv(filepath,index=True)
+        print('Performance table succesfully exported')    
         
     else:
         for assay in qc_data['Assay'].unique():
