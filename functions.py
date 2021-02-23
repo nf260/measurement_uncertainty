@@ -21,13 +21,20 @@ def load_randox(filename, mappings):
     randoxMU = randoxMU.sort_values(by=['Randox','Mean'])
     
     ## Calculate the percentage CV
-    randoxMU['% CV'] = round(randoxMU['UOM']/randoxMU['Mean'] * 100,1)
+    randoxMU['% CV'] = round(randoxMU['UOM']/randoxMU['Mean'] * 100,2)
     
-    ## Urine, Plasma and CSF QCs are all stored in Randox under the same name.
-    ## Add an extra note in the Randox column for urine QC to distinguish these,
-    ## identified by the lot number starting with "AAU"
+    ## Amino acid QCs are all stored in Randox under the same name.
+    ## For CSF, select all AAA QCs, create a copy and add a suffix to distinguish these
+    csf_aa = randoxMU[randoxMU['Instrument'] == 'AAA+'].copy()
+    csf_aa['Randox'] = csf_aa['Randox'].astype(str) + ' (CSF)'
+    
+    ## For urine/plasma, identify urine QC by the lot number starting with "AAU"
     randoxMU['Randox'][randoxMU['Lot Name'].str[:3] == 'AAU'] = randoxMU['Randox'].astype(str) + ' (Urine)'
     
+    ## Add the CSF amino acid QCs to the rest of the QC data
+    ## (needs to be after previous step to avoid adding "urine" suffix)
+    randoxMU = pd.concat([randoxMU,csf_aa],ignore_index=True)
+
     ## Read the mappings csv file and join this with the QC data to show the Assay and Measurand name, and import LoQ
     mappings = pd.read_csv(mappings)
     qc_data = mappings.merge(right=randoxMU,on='Randox',how='inner')
@@ -55,9 +62,6 @@ def qc_lot_summary(qc_data, assay, count_thresh=1):
     ## Drop any QC values where there are fewer than count_thresh datapoints
     assay_qc_data = assay_qc_data[assay_qc_data['Count'] >= count_thresh]
     
-    ## Round the data to 2 decimal places
-    assay_qc_data = assay_qc_data.round(2)
-    
     ## Pivot the data and reorder levels
     assay_qc_pivot = assay_qc_data.pivot(index='Measurand', values=column_order, columns=['Lot Name','Instrument'])
     assay_qc_pivot = assay_qc_pivot.swaplevel(0,2, axis=1).sort_index(axis=1)
@@ -82,6 +86,9 @@ def qc_lot_summary(qc_data, assay, count_thresh=1):
     ## Fill blanks
     assay_qc_pivot = assay_qc_pivot.fillna('')
     
+    ## Round the data to 2 decimal places
+    assay_qc_data = assay_qc_data.round(2)
+    
     return assay_qc_pivot
 
 def conditional_mean(series):
@@ -100,8 +107,8 @@ def qc_aggregated(qc_data, assay, count_thresh=1):
     '''
     mappings = pd.read_csv("data\\raw_data\\mappings.csv")
     all_measurands = mappings[mappings['Assay'] == assay]
-    all_measurands = all_measurands.reset_index()[['Measurand','Order']]
-    
+    all_measurands = all_measurands.reset_index()[['Measurand','Order','IsRatio','ratio_numerator','ratio_denominator']]
+
     ## Filter qc data for assay values only
     filtered = qc_data[qc_data['Assay'] == assay].drop(columns=['Assay','Randox'])
     
@@ -112,17 +119,42 @@ def qc_aggregated(qc_data, assay, count_thresh=1):
     aggregated = filtered.groupby('Measurand').agg({'Count':'sum',
                                               'UOM':'mean',
                                               '% CV':'mean'})
-    
+        
     ## Merge with mappings to show all measurands (so that they appear even if no QC data) and order by sort order
     aggregated = aggregated.merge(right=all_measurands,on='Measurand',how='outer')
     aggregated = aggregated.sort_values(by='Order', ignore_index=True)
-    aggregated = aggregated.drop(columns='Order')
     aggregated = aggregated.set_index('Measurand')
+
+    ## Calculate simple ratios
+    # need to rename column so it doesn't have a space for df. naming
+    aggregated = aggregated.rename(columns={'% CV':'value'})
+    aggregated['value'] = aggregated.apply(
+    lambda x: np.sqrt(int(aggregated.loc[x.ratio_numerator]['value'])**2 + int(aggregated.loc[x.ratio_denominator]['value'])**2)
+    if x.IsRatio else x.value
+    ,axis=1
+    )
+    
+    # rename the column again
+    aggregated = aggregated.rename(columns={'value':'% CV'})
+
+    ## Calculate complex ratio (for acylcarnitines)
+    
+#     if assay='Acylcarnitines (Blood spot)':
+#         aggregated[aggregated['Measurand'] == '(C16 + C18:1)/C2 ratio']['% CV'] = 
+    
+    ## Calculate expanded uncertainty
+    aggregated['Expanded uncertainty'] = aggregated['% CV'] * 2
+    
+    ## Drop columns
+    aggregated = aggregated.drop(columns=['Order','IsRatio','ratio_numerator','ratio_denominator'])
+    
+    ## Round values
+    aggregated = aggregated.round(2)
     
     ## Fill blanks
     aggregated = aggregated.fillna('')
     
-    return aggregated.round(2)
+    return aggregated
 
 def qc_lot_summary_with_means(qc_data, assay, count_thresh=1):
     '''
@@ -135,11 +167,15 @@ def qc_lot_summary_with_means(qc_data, assay, count_thresh=1):
     assay_qc_pivot[('All instrument','All lots','Count')] = aggregated['Count']
     assay_qc_pivot[('All instrument','All lots','UOM')] = aggregated['UOM']
     assay_qc_pivot[('All instrument','All lots','% CV')] = aggregated['% CV']
+    assay_qc_pivot[('All instrument','All lots','Expanded uncertainty')] = aggregated['Expanded uncertainty']
+    
+    ## Round values
+    assay_qc_pivot = assay_qc_pivot.round(2)
     
     ## Fill blanks
     assay_qc_pivot = assay_qc_pivot.fillna('')
     
-    return assay_qc_pivot.round(2)
+    return assay_qc_pivot
 
 def assay_qc_data_export(df, count_thresh):
     '''
@@ -266,14 +302,16 @@ def eqa_summary_statistics(df,assay):
     eqa_summary = eqa_summary.sort_values(by='Order', ignore_index=True)
     eqa_summary = eqa_summary.drop(columns='Order')   
 
-    ## some jiggery pokery to get the multindex back
+    ## Reset index
     eqa_summary = eqa_summary.set_index('Measurand')
-    eqa_summary.columns = pd.MultiIndex.from_tuples(eqa_summary.columns)
+
+    ## Round values
+    eqa_summary = eqa_summary.round(2)
     
     ## Fill blanks
     eqa_summary = eqa_summary.fillna('')
     
-    return round(eqa_summary,1)
+    return eqa_summary
 
 def assay_eqa_data_export(df):
     '''
@@ -302,7 +340,8 @@ def load_performance_targets(filepath):
                                               ,'Bias Optimal','Bias Desirable','Bias Minimal'
                                               ,'TE Optimal','TE Desirable','TE Minimal','Source of performance targets'])
     performance_targets = performance_targets.drop(columns=['Biol CVi','Biol CVg','Source of performance targets'])
-    return performance_targets.round(1)
+    performance_targets = performance_targets.round(1)
+    return performance_targets
 
 def performance_table(qc_data, eqa_data, assay, count_thresh, targets):
     '''
@@ -349,7 +388,7 @@ def performance_table(qc_data, eqa_data, assay, count_thresh, targets):
         elif value > minimal:
             return "Not met"
         else:
-            return ""
+            return "Not evaluated"
     
     df['CV performance'] = df.apply(lambda x: performance(x['% CV'],x['Anal CV Optimal'],x['Anal CV Desirable'],x['Anal CV Minimal']), axis = 1)
     df['Bias performance'] = df.apply(lambda x: performance(x['% Bias'],x['Bias Optimal'],x['Bias Desirable'],x['Bias Minimal']), axis = 1)
@@ -362,17 +401,33 @@ def performance_table(qc_data, eqa_data, assay, count_thresh, targets):
     
     return df
 
-def assay_performance_data_export(qc_data, eqa_data, count_thresh, targets):
+def assay_performance_data_export(qc_data, eqa_data, count_thresh, targets, combined=True):
     '''
-    Createsa a performance summary table for each assay.
+    Creates a performance summary table for each assay, either as a separate .csv or combined.
     
-    Exports each table to a .csv file in the processed data folder
+    Exports each table to a separate .csv file in the processed data folder
     '''
-    for assay in qc_data['Assay'].unique():
-        try:
-            filepath = os.path.abspath('') + '\\data\\processed\\performance_summary_tables\\' + assay + '.csv'
-            table =  performance_table(qc_data, eqa_data, assay, count_thresh, targets)
-            table.to_csv(filepath)
-            print(f'{assay} succesfully exported')
-        except:
-            print(f'!!! Error in exporting data for {assay}')
+    if combined:
+        filepath = os.path.abspath('') + '\\data\\processed\\performance_summary_tables\\combined.csv'
+        df = pd.DataFrame()
+        
+        for assay in qc_data['Assay'].unique():
+            try:
+                table =  performance_table(qc_data, eqa_data, assay, count_thresh, targets)
+                table['Assay'] = assay
+                df = pd.concat([df,table],ignore_index=True)
+            except:
+                print(f'!!! Error for assay: {assay}')                
+        
+    df.to_csv(filepath)
+    print('Performance table succesfully exported')    
+        
+    else:
+        for assay in qc_data['Assay'].unique():
+            try:
+                filepath = os.path.abspath('') + '\\data\\processed\\performance_summary_tables\\' + assay + '.csv'
+                table =  performance_table(qc_data, eqa_data, assay, count_thresh, targets)
+                table.to_csv(filepath)
+                print(f'{assay} succesfully exported')
+            except:
+                print(f'!!! Error in exporting data for {assay}')
