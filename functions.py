@@ -26,7 +26,7 @@ def load_randox(filename, mappings):
     ## Amino acid QCs are all stored in Randox under the same name.
     ## For CSF, select all AAA QCs, create a copy and add a suffix to distinguish these
     csf_aa = randoxMU[randoxMU['Instrument'] == 'AAA+'].copy()
-    csf_aa['Randox'] = csf_aa['Randox'].astype(str) + ' (CSF)'
+    csf_aa['Randox'] = csf_aa['Randox'].astype(str) + '(CSF)'
     
     ## For urine/plasma, identify urine QC (except phosphoethanolamine) by the lot number starting with "AAU"
     randoxMU['Randox'][randoxMU['Lot Name'].str[:3] == 'AAU'] = randoxMU['Randox'].astype(str) + ' (Urine)' 
@@ -189,6 +189,9 @@ def assay_qc_data_export(df, count_thresh):
             
 ### EQA FUNCTIONS ###
 
+def combined_uncertainty(std,target_value_uncert):
+    return np.sqrt(std**2 + target_value_uncert**2)
+    
 def load_eqa(folder):
     '''
     Load EQA detail from folder
@@ -252,14 +255,24 @@ def eqa_assay_bias_plot(df, assay):
     '''
     Plot %bias against target value for all analytes in a single scheme
     '''
-    df = df[df['Assay'] == assay]    
+    # Select EQA data for assay
+    df = df[(df['Assay'] == assay)]
     
-    g = sns.FacetGrid(data=df, col='Measurand', col_wrap=5, sharex=False)
-    g = g.map(plt.scatter, "Targ", "% Bias", edgecolor="w")
-    g.fig.suptitle(f'EQA results: {assay}', ha='left', x=0, weight='bold')
-    g.fig.subplots_adjust(top=0.8)
-    g.set_xlabels('Target value')
-    g.savefig(fname = f'data\\processed\\eqa_bias_plot\\{assay}.png', dpi=200)
+    # Drop any analytes that do not have an EQA scheme
+    df = df.dropna(subset=['EQA analyte name'])
+    
+    # Plot the data (if there is any)
+    if len(df) > 0:
+        g = sns.FacetGrid(data=df, col='Measurand', col_wrap=5, sharex=False)
+        g = g.map(plt.scatter, "Targ", "% Bias", edgecolor="w")
+        g.fig.suptitle(f'EQA results: {assay}', ha='left', x=0, weight='bold')
+        g.fig.subplots_adjust(top=0.8)
+        g.set_xlabels('Target value')
+        g.savefig(fname = f'data\\processed\\eqa_bias_plot\\{assay}.png', dpi=200)
+    
+    # Otherwise tell us that there is no data
+    else:
+        print(f'No EQA data for {assay}')
 
 def eqa_bias_multi_plot(df):
     '''
@@ -276,11 +289,7 @@ def eqa_summary_statistics(df,assay):
     '''
     eqa_summary = df[df['Assay'] == assay]
     eqa_summary = eqa_summary.groupby('Measurand').agg({'Specimen':'count','Targ':['min','max'],'% Bias':['mean','std'],'% uncertainty in target value':'mean'})
-    
-    ## Function used to combined uncertainties
-    def combined_uncertainty(std,target_value_uncert):
-        return np.sqrt(std**2 + target_value_uncert**2)
-    
+        
     ## Combine standard deviation of bias with average uncertainty in the target value
     eqa_summary['Combined uncertainty of % bias'] = eqa_summary.apply(lambda x: combined_uncertainty(x[('% Bias','std')],x[('% uncertainty in target value', 'mean')]), axis = 1)
 
@@ -347,6 +356,21 @@ def assay_eqa_data_export(df):
 
 #### PERFORMANCE TARGETS FUNCTIONS ###
 
+def total_error(cv,bias):
+    return round(abs(bias) + 1.65*cv,1)
+
+def performance(value, optimal, desirable, minimal):
+    if abs(value) <= optimal:
+        return "Optimal"
+    elif abs(value) <= desirable:
+        return "Desirable"
+    elif abs(value) <= minimal:
+        return "Minimal"
+    elif abs(value) > minimal:
+        return "Not met"
+    else:
+        return "Not evaluated"
+        
 def load_performance_targets(filepath):
     '''
     Load performance targets data from Excel file
@@ -376,17 +400,14 @@ def performance_table(qc_data, eqa_data, assay, count_thresh, targets):
     
     # Select only the % Bias column and measurand name
     bias.columns = bias.columns.get_level_values(0)
-    bias = bias.reset_index()[['Measurand',('Combined uncertainty of % bias','')]]
-    bias = bias.rename(columns={('Combined uncertainty of % bias',''):'% Bias'})
+    bias = bias.reset_index()[['Measurand',('% Bias', 'mean')]]
+    bias = bias.rename(columns={('% Bias', 'mean'):'% Bias'})
     
     ### Merge imprecision and bias data
     df = imprec.merge(right=bias,on='Measurand',how='outer')
     df[['% CV','% Bias']] = df[['% CV','% Bias']].apply(pd.to_numeric, errors='ignore')
     
     ### Calculate total error
-    def total_error(cv,bias):
-        return round(abs(bias) + 1.65*cv,1)
-    
     df['Total error'] = df.apply(lambda x: total_error(x['% CV'],x['% Bias']),axis=1)
     
     ### Merge with performance targets
@@ -394,19 +415,7 @@ def performance_table(qc_data, eqa_data, assay, count_thresh, targets):
     df = df.merge(right=targets,on='Measurand',how='outer')
     #df = df.fillna('')
     
-    ### Calculate performance against performance targets
-    def performance(value, optimal, desirable, minimal):
-        if value <= optimal:
-            return "Optimal"
-        elif value <= desirable:
-            return "Desirable"
-        elif value <= minimal:
-            return "Minimal"
-        elif value > minimal:
-            return "Not met"
-        else:
-            return "Not evaluated"
-    
+    ### Calculate performance against performance targets  
     df['CV performance'] = df.apply(lambda x: performance(x['% CV'],x['Anal CV Optimal'],x['Anal CV Desirable'],x['Anal CV Minimal']), axis = 1)
     df['Bias performance'] = df.apply(lambda x: performance(x['% Bias'],x['Bias Optimal'],x['Bias Desirable'],x['Bias Minimal']), axis = 1)
     df['TAE performance'] = df.apply(lambda x: performance(x['Total error'],x['TE Optimal'],x['TE Desirable'],x['TE Minimal']), axis = 1)
